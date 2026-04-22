@@ -51,7 +51,6 @@ WAITING_BCAST = 2
 # ── KEYBOARDS ────────────────────────────────────────────
 
 def msg_kb(uid):
-    """Two buttons under every user message."""
     return InlineKeyboardMarkup([[
         InlineKeyboardButton("↩️ Reply", callback_data=f"reply:{uid}"),
         InlineKeyboardButton("☰ Menu",   callback_data=f"menu:{uid}"),
@@ -78,6 +77,64 @@ def user_kb(uid):
          InlineKeyboardButton("🔙 Back",    callback_data="adm:users")],
     ])
 
+# ── SEND ANY MEDIA TO A CHAT ─────────────────────────────
+
+async def forward_media(bot, msg, chat_id, caption=None):
+    """
+    Forward whatever media type is in msg to chat_id.
+    Returns the sent Message object.
+    """
+    if msg.photo:
+        return await bot.send_photo(
+            chat_id=chat_id,
+            photo=msg.photo[-1].file_id,
+            caption=caption
+        )
+    elif msg.video:
+        return await bot.send_video(
+            chat_id=chat_id,
+            video=msg.video.file_id,
+            caption=caption
+        )
+    elif msg.audio:
+        return await bot.send_audio(
+            chat_id=chat_id,
+            audio=msg.audio.file_id,
+            caption=caption
+        )
+    elif msg.voice:
+        return await bot.send_voice(
+            chat_id=chat_id,
+            voice=msg.voice.file_id,
+            caption=caption
+        )
+    elif msg.document:
+        return await bot.send_document(
+            chat_id=chat_id,
+            document=msg.document.file_id,
+            caption=caption
+        )
+    elif msg.sticker:
+        return await bot.send_sticker(
+            chat_id=chat_id,
+            sticker=msg.sticker.file_id
+        )
+    elif msg.text:
+        return await bot.send_message(
+            chat_id=chat_id,
+            text=msg.text
+        )
+    return None
+
+def media_label(msg):
+    if msg.photo:    return "📷 Photo"
+    if msg.video:    return "🎬 Video"
+    if msg.audio:    return "🎵 Audio"
+    if msg.voice:    return "🎤 Voice"
+    if msg.document: return "📎 File"
+    if msg.sticker:  return "🎭 Sticker"
+    return "💬 Text"
+
 # ── /start ───────────────────────────────────────────────
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -103,7 +160,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     waiting_name.add(uid)
     await update.message.reply_text("Welcome! What's your name?")
 
-# ── USER MESSAGES ────────────────────────────────────────
+# ── USER → ADMIN (text) ──────────────────────────────────
 
 async def handle_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
@@ -111,10 +168,10 @@ async def handle_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = update.message.text
 
     if user.id == ADMIN_ID:
-        return   # admin free text ignored outside ConversationHandler
+        return
 
     if uid in db["users"] and db["users"][uid].get("banned"):
-        return   # silent for banned users
+        return
 
     # Name registration
     if uid in waiting_name:
@@ -144,11 +201,51 @@ async def handle_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
         msg_map[str(sent.message_id)] = uid
         save_msg_map()
         log_msg(uid, text, "sent")
-        # No confirmation sent to user — keep it clean
 
     except Exception as e:
         print("Forward error:", e)
         log_msg(uid, text, "failed")
+
+# ── USER → ADMIN (media) ─────────────────────────────────
+
+async def handle_user_media(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    uid  = str(user.id)
+    msg  = update.message
+
+    if user.id == ADMIN_ID:
+        return
+
+    if uid in db["users"] and db["users"][uid].get("banned"):
+        return
+
+    if uid not in db["users"]:
+        waiting_name.add(uid)
+        await msg.reply_text("What's your name?")
+        return
+
+    name  = db["users"][uid]["name"]
+    label = media_label(msg)
+
+    try:
+        # Send label header first
+        header = await context.bot.send_message(
+            chat_id=ADMIN_ID,
+            text=f"*{name}* · {label}",
+            parse_mode="Markdown",
+            reply_markup=msg_kb(uid)
+        )
+        msg_map[str(header.message_id)] = uid
+
+        # Forward the actual media
+        await forward_media(context.bot, msg, ADMIN_ID,
+                            caption=msg.caption or None)
+
+        save_msg_map()
+        log_msg(uid, label, "sent")
+
+    except Exception as e:
+        print("Media forward error:", e)
 
 # ── REPLY ConversationHandler ────────────────────────────
 
@@ -166,17 +263,17 @@ async def reply_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data["reply_name"] = name
 
     await query.message.reply_text(
-        f"↩️ *{name}* — type your reply:\n/cancel to abort",
+        f"↩️ *{name}* — send your reply (text, image, video, audio, file):\n/cancel to abort",
         parse_mode="Markdown"
     )
     return WAITING_REPLY
 
 
 async def reply_send(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle text reply from admin."""
     if update.effective_user.id != ADMIN_ID:
         return ConversationHandler.END
 
-    text = update.message.text.strip()
     uid  = context.user_data.get("reply_uid")
     name = context.user_data.get("reply_name", "User")
 
@@ -185,9 +282,36 @@ async def reply_send(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return ConversationHandler.END
 
     try:
-        await context.bot.send_message(chat_id=int(uid), text=text)
-        log_msg(uid, f"[→] {text}", "admin_reply")
+        await context.bot.send_message(chat_id=int(uid), text=update.message.text)
+        log_msg(uid, f"[→] {update.message.text}", "admin_reply")
         await update.message.reply_text(f"✅ Sent to {name}")
+    except Exception as e:
+        await update.message.reply_text(f"❌ Failed: {e}")
+
+    context.user_data.clear()
+    return ConversationHandler.END
+
+
+async def reply_send_media(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle media reply from admin."""
+    if update.effective_user.id != ADMIN_ID:
+        return ConversationHandler.END
+
+    uid  = context.user_data.get("reply_uid")
+    name = context.user_data.get("reply_name", "User")
+
+    if not uid:
+        await update.message.reply_text("Session lost. Click ↩️ Reply again.")
+        return ConversationHandler.END
+
+    msg   = update.message
+    label = media_label(msg)
+
+    try:
+        await forward_media(context.bot, msg, int(uid),
+                            caption=msg.caption or None)
+        log_msg(uid, f"[→] {label}", "admin_reply")
+        await update.message.reply_text(f"✅ {label} sent to {name}")
     except Exception as e:
         await update.message.reply_text(f"❌ Failed: {e}")
 
@@ -211,7 +335,7 @@ async def bcast_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     active = sum(1 for u in db["users"].values() if not u.get("banned"))
     await query.message.reply_text(
-        f"📢 Broadcast to {active} users — type your message:\n/cancel to abort"
+        f"📢 Broadcast to {active} users — send message (text or media):\n/cancel to abort"
     )
     return WAITING_BCAST
 
@@ -220,15 +344,19 @@ async def bcast_send(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id != ADMIN_ID:
         return ConversationHandler.END
 
-    text = update.message.text.strip()
+    msg = update.message
     ok = failed = 0
-    status = await update.message.reply_text("Sending...")
+    status = await msg.reply_text("Sending...")
 
     for uid, u in db["users"].items():
         if u.get("banned"):
             continue
         try:
-            await context.bot.send_message(chat_id=int(uid), text=text)
+            if msg.text:
+                await context.bot.send_message(chat_id=int(uid), text=msg.text)
+            else:
+                await forward_media(context.bot, msg, int(uid),
+                                    caption=msg.caption or None)
             ok += 1
         except Exception:
             failed += 1
@@ -253,7 +381,6 @@ async def buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     data = query.data
 
-    # Menu button on a user message → show user profile
     if data.startswith("menu:"):
         uid  = data.split(":")[1]
         u    = db["users"].get(uid, {})
@@ -270,7 +397,7 @@ async def buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not data.startswith("adm:"):
         return
 
-    parts = data.split(":")   # ["adm", sub, (uid)?]
+    parts = data.split(":")
     sub   = parts[1]
 
     if sub == "back":
@@ -369,16 +496,34 @@ def run_web():
 def run_bot():
     app = ApplicationBuilder().token(TOKEN).build()
 
+    # Media filter for all non-text content
+    MEDIA_FILTER = (
+        filters.PHOTO | filters.VIDEO | filters.AUDIO |
+        filters.VOICE | filters.Document.ALL | filters.Sticker.ALL
+    )
+
+    # Reply conversation — accepts BOTH text and media
     reply_conv = ConversationHandler(
         entry_points=[CallbackQueryHandler(reply_start, pattern=r"^reply:")],
-        states={WAITING_REPLY: [MessageHandler(filters.TEXT & ~filters.COMMAND, reply_send)]},
+        states={
+            WAITING_REPLY: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, reply_send),
+                MessageHandler(MEDIA_FILTER,                     reply_send_media),
+            ]
+        },
         fallbacks=[CommandHandler("cancel", reply_cancel)],
         per_user=True, per_chat=True,
     )
 
+    # Broadcast conversation — accepts BOTH text and media
     bcast_conv = ConversationHandler(
         entry_points=[CallbackQueryHandler(bcast_start, pattern=r"^adm:broadcast$")],
-        states={WAITING_BCAST: [MessageHandler(filters.TEXT & ~filters.COMMAND, bcast_send)]},
+        states={
+            WAITING_BCAST: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, bcast_send),
+                MessageHandler(MEDIA_FILTER,                     bcast_send),
+            ]
+        },
         fallbacks=[CommandHandler("cancel", bcast_cancel)],
         per_user=True, per_chat=True,
     )
@@ -387,7 +532,11 @@ def run_bot():
     app.add_handler(reply_conv)
     app.add_handler(bcast_conv)
     app.add_handler(CallbackQueryHandler(buttons))
+
+    # User text messages
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_user))
+    # User media messages (forwarded to admin with Reply + Menu buttons)
+    app.add_handler(MessageHandler(MEDIA_FILTER, handle_user_media))
 
     print("Bot running...")
     app.run_polling(drop_pending_updates=True)
