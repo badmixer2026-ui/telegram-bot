@@ -15,11 +15,11 @@ from telegram.ext import (
 )
 
 TOKEN = os.getenv("BOT_TOKEN")
-ADMIN_ID = 6388027054  # 🔴 replace
+ADMIN_ID = 6388027054  # 🔴 PUT YOUR TELEGRAM ID
 
 DATA_FILE = "data.json"
 
-# ------------------ DATABASE ------------------
+# ---------------- DATABASE ----------------
 
 def load_db():
     if not os.path.exists(DATA_FILE):
@@ -33,14 +33,11 @@ def save_db():
 
 db = load_db()
 
-# ------------------ STATES ------------------
+# ---------------- STATE ----------------
 
 waiting_name = set()
 
-# ------------------ UTIL ------------------
-
-def get_user(uid):
-    return db["users"].get(uid)
+# ---------------- UTIL ----------------
 
 def add_message(uid, text, status):
     if uid not in db["messages"]:
@@ -52,7 +49,7 @@ def add_message(uid, text, status):
     })
     save_db()
 
-# ------------------ START ------------------
+# ---------------- START ----------------
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = str(update.effective_user.id)
@@ -64,18 +61,18 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     waiting_name.add(uid)
     await update.message.reply_text("Enter your name:")
 
-# ------------------ USER MESSAGE ------------------
+# ---------------- USER MESSAGE ----------------
 
 async def handle_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     uid = str(user.id)
     text = update.message.text
 
-    # banned
+    # banned check
     if uid in db["users"] and db["users"][uid].get("banned"):
         return
 
-    # name input
+    # name setup
     if uid in waiting_name:
         db["users"][uid] = {"name": text, "banned": False}
         waiting_name.remove(uid)
@@ -84,16 +81,13 @@ async def handle_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(f"Hello {text} 👋\nSend your message:")
         return
 
-    # typing indicator
+    # typing indicator (admin side)
     await context.bot.send_chat_action(chat_id=ADMIN_ID, action="typing")
 
     name = db["users"][uid]["name"]
 
     keyboard = [
-        [
-            InlineKeyboardButton("Reply", callback_data=f"reply:{uid}"),
-            InlineKeyboardButton("Ban", callback_data=f"ban:{uid}")
-        ]
+        [InlineKeyboardButton("🚫 Ban", callback_data=f"ban:{uid}")]
     ]
 
     try:
@@ -103,30 +97,29 @@ async def handle_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
             reply_markup=InlineKeyboardMarkup(keyboard)
         )
 
-        # map message
+        # map message → user
         context.bot_data[sent.message_id] = uid
 
         add_message(uid, text, "sent")
 
     except Exception:
         add_message(uid, text, "failed")
-
         asyncio.create_task(notify_fail(context, uid))
 
-# ------------------ FAIL NOTIFY ------------------
+# ---------------- FAIL NOTIFY ----------------
 
 async def notify_fail(context, uid):
     await asyncio.sleep(300)
 
     try:
         await context.bot.send_message(
-            chat_id=uid,
+            chat_id=int(uid),
             text="❌ Message not delivered.\nContact: aisignalbot@proton.me"
         )
     except:
         pass
 
-# ------------------ ADMIN REPLY ------------------
+# ---------------- ADMIN REPLY (FIXED) ----------------
 
 async def admin_reply(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id != ADMIN_ID:
@@ -134,12 +127,24 @@ async def admin_reply(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     msg = update.message
 
-    # reply method
-    if msg.reply_to_message:
-        mid = msg.reply_to_message.message_id
-        uid = context.bot_data.get(mid)
+    # must reply to a message
+    if not msg.reply_to_message:
+        return
 
-        if uid:
+    original = msg.reply_to_message
+
+    # get mapped user id
+    uid = context.bot_data.get(original.message_id)
+
+    # fallback (if mapping lost)
+    if not uid and "🆔" in original.text:
+        try:
+            uid = original.text.split("🆔")[1].strip().split("\n")[0]
+        except:
+            return
+
+    if uid:
+        try:
             await context.bot.send_chat_action(chat_id=int(uid), action="typing")
 
             await context.bot.send_message(
@@ -149,39 +154,27 @@ async def admin_reply(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
             add_message(uid, msg.text, "admin_reply")
 
-# ------------------ BUTTON ACTION ------------------
+        except Exception as e:
+            print("Reply error:", e)
+
+# ---------------- BAN BUTTON ----------------
 
 async def buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
 
-    data = query.data
-    uid = data.split(":")[1]
-
     if query.from_user.id != ADMIN_ID:
         return
+
+    data = query.data
+    uid = data.split(":")[1]
 
     if data.startswith("ban"):
         db["users"][uid]["banned"] = True
         save_db()
         await query.edit_message_text("🚫 User banned")
 
-    elif data.startswith("reply"):
-        context.user_data["reply_to"] = uid
-        await query.message.reply_text("Send reply message...")
-
-# ------------------ ADMIN DIRECT REPLY ------------------
-
-async def admin_direct(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_user.id != ADMIN_ID:
-        return
-
-    uid = context.user_data.get("reply_to")
-    if uid:
-        await context.bot.send_message(chat_id=int(uid), text=update.message.text)
-        context.user_data["reply_to"] = None
-
-# ------------------ USERS LIST ------------------
+# ---------------- USERS LIST ----------------
 
 async def users_list(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id != ADMIN_ID:
@@ -193,7 +186,7 @@ async def users_list(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     await update.message.reply_text(text)
 
-# ------------------ FLASK ------------------
+# ---------------- FLASK (KEEP ALIVE) ----------------
 
 web = Flask(__name__)
 
@@ -204,7 +197,7 @@ def home():
 def run_web():
     web.run(host="0.0.0.0", port=10000)
 
-# ------------------ MAIN ------------------
+# ---------------- MAIN ----------------
 
 def run_bot():
     app = ApplicationBuilder().token(TOKEN).build()
@@ -214,13 +207,11 @@ def run_bot():
 
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_user))
     app.add_handler(MessageHandler(filters.REPLY, admin_reply))
-    app.add_handler(MessageHandler(filters.TEXT & filters.User(ADMIN_ID), admin_direct))
-
     app.add_handler(CallbackQueryHandler(buttons))
 
     app.run_polling()
 
-# ------------------ START ------------------
+# ---------------- START ----------------
 
 threading.Thread(target=run_web).start()
 run_bot()
