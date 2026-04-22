@@ -11,202 +11,311 @@ from telegram import (
 from telegram.ext import (
     ApplicationBuilder, CommandHandler,
     MessageHandler, CallbackQueryHandler,
-    ContextTypes, filters
+    ContextTypes, ConversationHandler, filters
 )
 
-TOKEN = os.getenv("BOT_TOKEN")
-ADMIN_ID = 6388027054  # ✅ Your Telegram ID
+TOKEN    = os.getenv("BOT_TOKEN")
+ADMIN_ID = 6388027054
 
-DATA_FILE = "data.json"
-
-# ---------------- DATABASE ----------------
-
-def load_db():
-    if not os.path.exists(DATA_FILE):
-        return {"users": {}, "messages": {}}
-    with open(DATA_FILE, "r") as f:
-        return json.load(f)
-
-def save_db():
-    with open(DATA_FILE, "w") as f:
-        json.dump(db, f, indent=2)
-
-db = load_db()
-
-# Persist bot_data mapping across restarts
+DATA_FILE    = "data.json"
 MSG_MAP_FILE = "msg_map.json"
 
-def load_msg_map():
-    if not os.path.exists(MSG_MAP_FILE):
-        return {}
-    with open(MSG_MAP_FILE, "r") as f:
+# ═══════════════════════════════════════════
+#  DATABASE
+# ═══════════════════════════════════════════
+
+def load_json(path, default):
+    if not os.path.exists(path):
+        return default
+    with open(path, "r") as f:
         return json.load(f)
 
-def save_msg_map(msg_map):
-    with open(MSG_MAP_FILE, "w") as f:
-        json.dump(msg_map, f)
+def save_json(path, data):
+    with open(path, "w") as f:
+        json.dump(data, f, indent=2)
 
-msg_map = load_msg_map()  # { str(message_id): uid }
+db      = load_json(DATA_FILE,    {"users": {}, "messages": {}})
+msg_map = load_json(MSG_MAP_FILE, {})   # { str(msg_id): uid }
 
-# ---------------- STATE ----------------
-
-waiting_name = set()
-
-# ---------------- UTIL ----------------
+def save_db():      save_json(DATA_FILE,    db)
+def save_msg_map(): save_json(MSG_MAP_FILE, msg_map)
 
 def add_message(uid, text, status):
-    if uid not in db["messages"]:
-        db["messages"][uid] = []
-    db["messages"][uid].append({
-        "text": text,
-        "time": str(datetime.now()),
+    db["messages"].setdefault(uid, []).append({
+        "text":   text,
+        "time":   str(datetime.now()),
         "status": status
     })
     save_db()
 
-# ---------------- START ----------------
+# ═══════════════════════════════════════════
+#  STATE
+# ═══════════════════════════════════════════
+
+waiting_name    = set()
+WAITING_REPLY   = 1
+WAITING_BCAST   = 2
+
+# ═══════════════════════════════════════════
+#  KEYBOARDS
+# ═══════════════════════════════════════════
+
+def admin_menu_kb():
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("👥 Users",     callback_data="menu:users"),
+         InlineKeyboardButton("🚫 Banned",    callback_data="menu:banned")],
+        [InlineKeyboardButton("📢 Broadcast", callback_data="menu:broadcast")],
+    ])
+
+def message_kb(uid):
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("↩️ Reply",   callback_data=f"reply:{uid}"),
+         InlineKeyboardButton("🚫 Ban",     callback_data=f"ban:{uid}")],
+        [InlineKeyboardButton("📋 History", callback_data=f"history:{uid}")],
+    ])
+
+def user_manage_kb(uid):
+    banned  = db["users"].get(uid, {}).get("banned", False)
+    ban_btn = (
+        InlineKeyboardButton("✅ Unban", callback_data=f"unban:{uid}")
+        if banned else
+        InlineKeyboardButton("🚫 Ban",   callback_data=f"ban:{uid}")
+    )
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("↩️ Reply",   callback_data=f"reply:{uid}"),
+         ban_btn],
+        [InlineKeyboardButton("📋 History", callback_data=f"history:{uid}"),
+         InlineKeyboardButton("🔙 Back",    callback_data="menu:users")],
+    ])
+
+# ═══════════════════════════════════════════
+#  /start
+# ═══════════════════════════════════════════
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = str(update.effective_user.id)
 
-    if uid == str(ADMIN_ID):
-        await update.message.reply_text("👑 Admin panel active.\n\n/users — list all users")
+    if update.effective_user.id == ADMIN_ID:
+        total  = len(db["users"])
+        banned = sum(1 for u in db["users"].values() if u.get("banned"))
+        await update.message.reply_text(
+            f"👑 *Admin Panel*\n"
+            f"━━━━━━━━━━━━━━━\n"
+            f"👥 Total users : {total}\n"
+            f"🚫 Banned      : {banned}\n"
+            f"━━━━━━━━━━━━━━━",
+            parse_mode="Markdown",
+            reply_markup=admin_menu_kb()
+        )
         return
 
     if uid in db["users"]:
-        await update.message.reply_text(f"Welcome back {db['users'][uid]['name']} 👋\nSend your message:")
+        if db["users"][uid].get("banned"):
+            await update.message.reply_text("🚫 You have been banned.")
+            return
+        await update.message.reply_text(
+            f"👋 Welcome back, *{db['users'][uid]['name']}*!\nSend your message below 👇",
+            parse_mode="Markdown"
+        )
         return
 
     waiting_name.add(uid)
-    await update.message.reply_text("👋 Welcome! Please enter your name:")
+    await update.message.reply_text(
+        "👋 Welcome!\n\nPlease enter your *name* to get started:",
+        parse_mode="Markdown"
+    )
 
-# ---------------- USER MESSAGE ----------------
+# ═══════════════════════════════════════════
+#  USER → ADMIN (forward messages)
+# ═══════════════════════════════════════════
 
 async def handle_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
-    uid = str(user.id)
+    uid  = str(user.id)
     text = update.message.text
 
-    # ── ADMIN REPLY HANDLER (must be first) ──────────────────────────────
+    # Admin free text — show menu
     if user.id == ADMIN_ID:
-        msg = update.message
-
-        if not msg.reply_to_message:
-            # Not a reply — ignore (admin can type commands freely)
-            return
-
-        original_msg_id = str(msg.reply_to_message.message_id)
-
-        # Look up uid from persistent map
-        target_uid = msg_map.get(original_msg_id)
-
-        # Fallback: parse from message text
-        if not target_uid and msg.reply_to_message.text and "🆔" in msg.reply_to_message.text:
-            try:
-                target_uid = msg.reply_to_message.text.split("🆔")[1].strip().split()[0]
-            except Exception:
-                pass
-
-        if not target_uid:
-            await update.message.reply_text("⚠️ Could not identify user. Try again.")
-            return
-
-        target_name = db["users"].get(target_uid, {}).get("name", "Unknown")
-
-        try:
-            await context.bot.send_chat_action(chat_id=int(target_uid), action="typing")
-            await asyncio.sleep(0.5)
-
-            await context.bot.send_message(
-                chat_id=int(target_uid),
-                text=f"📨 *Reply from Admin:*\n\n{text}",
-                parse_mode="Markdown"
-            )
-
-            add_message(target_uid, f"[ADMIN→USER] {text}", "admin_reply")
-
-            await update.message.reply_text(f"✅ Sent to *{target_name}*", parse_mode="Markdown")
-
-        except Exception as e:
-            await update.message.reply_text(f"❌ Failed to send: {e}")
+        await update.message.reply_text(
+            "Use /start to open the admin panel,\nor click ↩️ Reply on a user message.",
+            reply_markup=admin_menu_kb()
+        )
         return
-    # ─────────────────────────────────────────────────────────────────────
 
-    # banned check
+    # Banned
     if uid in db["users"] and db["users"][uid].get("banned"):
-        await update.message.reply_text("🚫 You have been banned.")
+        await update.message.reply_text("🚫 You are banned from using this bot.")
         return
 
-    # name setup
+    # Name registration
     if uid in waiting_name:
-        db["users"][uid] = {"name": text, "banned": False}
-        waiting_name.remove(uid)
+        name = text.strip()
+        db["users"][uid] = {"name": name, "banned": False}
+        waiting_name.discard(uid)
         save_db()
-        await update.message.reply_text(f"Hello {text} 👋\nYou can now send your message:")
+        await update.message.reply_text(
+            f"✅ Hello, *{name}*!\nYou can now send messages. We'll reply as soon as possible 🙏",
+            parse_mode="Markdown"
+        )
         return
 
     if uid not in db["users"]:
         waiting_name.add(uid)
-        await update.message.reply_text("Please enter your name first:")
+        await update.message.reply_text("Please enter your *name* first:", parse_mode="Markdown")
         return
 
     name = db["users"][uid]["name"]
 
-    keyboard = [
-        [
-            InlineKeyboardButton("🚫 Ban", callback_data=f"ban:{uid}"),
-            InlineKeyboardButton("📋 History", callback_data=f"history:{uid}")
-        ]
-    ]
-
     try:
-        await context.bot.send_chat_action(chat_id=ADMIN_ID, action="typing")
-
         sent = await context.bot.send_message(
             chat_id=ADMIN_ID,
             text=(
                 f"📩 *New Message*\n"
-                f"━━━━━━━━━━━━━━━\n"
-                f"{text}\n"
-                f"━━━━━━━━━━━━━━━\n"
-                f"👤 *{name}*\n"
-                f"🆔 `{uid}`\n\n"
-                f"↩️ _Swipe & reply to this message to respond_"
+                f"━━━━━━━━━━━━━━━━━━\n"
+                f"💬  {text}\n"
+                f"━━━━━━━━━━━━━━━━━━\n"
+                f"👤  *{name}*\n"
+                f"🆔  `{uid}`"
             ),
             parse_mode="Markdown",
-            reply_markup=InlineKeyboardMarkup(keyboard)
+            reply_markup=message_kb(uid)
         )
-
-        # Save mapping (persistent)
         msg_map[str(sent.message_id)] = uid
-        save_msg_map(msg_map)
-
-        # Also store in bot_data (in-memory fallback)
-        context.bot_data[sent.message_id] = uid
-
+        save_msg_map()
         add_message(uid, text, "sent")
-
-        await update.message.reply_text("✅ Message sent!")
+        await update.message.reply_text("✅ Message delivered!")
 
     except Exception as e:
         print("Forward error:", e)
         add_message(uid, text, "failed")
-        asyncio.create_task(notify_fail(context, uid))
-        await update.message.reply_text("⚠️ Delivery failed. We'll notify you.")
+        await update.message.reply_text("⚠️ Delivery failed. Please try again later.")
 
-# ---------------- FAIL NOTIFY ----------------
+# ═══════════════════════════════════════════
+#  ADMIN REPLY — ConversationHandler
+# ═══════════════════════════════════════════
 
-async def notify_fail(context, uid):
-    await asyncio.sleep(300)
+async def reply_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+
+    if query.from_user.id != ADMIN_ID:
+        return ConversationHandler.END
+
+    uid  = query.data.split(":")[1]
+    name = db["users"].get(uid, {}).get("name", "Unknown")
+
+    context.user_data["reply_uid"]  = uid
+    context.user_data["reply_name"] = name
+
+    await query.message.reply_text(
+        f"↩️ *Replying to {name}*\n\n"
+        f"Type your reply below 👇\n"
+        f"_/cancel to cancel_",
+        parse_mode="Markdown"
+    )
+    return WAITING_REPLY
+
+
+async def reply_send(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id != ADMIN_ID:
+        return ConversationHandler.END
+
+    text = update.message.text.strip()
+    uid  = context.user_data.get("reply_uid")
+    name = context.user_data.get("reply_name", "User")
+
+    if not uid:
+        await update.message.reply_text("⚠️ Session lost. Click ↩️ Reply again.")
+        return ConversationHandler.END
+
     try:
+        await context.bot.send_chat_action(chat_id=int(uid), action="typing")
+        await asyncio.sleep(0.5)
+
         await context.bot.send_message(
             chat_id=int(uid),
-            text="❌ Message not delivered.\nContact: aisignalbot@proton.me"
+            text=f"📨 *Reply from Admin:*\n\n{text}",
+            parse_mode="Markdown"
         )
-    except Exception:
-        pass
+        add_message(uid, f"[ADMIN→USER] {text}", "admin_reply")
+        await update.message.reply_text(
+            f"✅ Reply sent to *{name}*!",
+            parse_mode="Markdown",
+            reply_markup=admin_menu_kb()
+        )
 
-# ---------------- BAN / HISTORY BUTTONS ----------------
+    except Exception as e:
+        await update.message.reply_text(f"❌ Failed:\n`{e}`", parse_mode="Markdown")
+
+    context.user_data.clear()
+    return ConversationHandler.END
+
+
+async def reply_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    context.user_data.clear()
+    await update.message.reply_text("❌ Reply cancelled.", reply_markup=admin_menu_kb())
+    return ConversationHandler.END
+
+# ═══════════════════════════════════════════
+#  BROADCAST — ConversationHandler
+# ═══════════════════════════════════════════
+
+async def broadcast_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+
+    if query.from_user.id != ADMIN_ID:
+        return ConversationHandler.END
+
+    active = sum(1 for u in db["users"].values() if not u.get("banned"))
+    await query.message.reply_text(
+        f"📢 *Broadcast*\n\n"
+        f"Will be sent to *{active}* active users.\n\n"
+        f"Type your message 👇\n_/cancel to cancel_",
+        parse_mode="Markdown"
+    )
+    return WAITING_BCAST
+
+
+async def broadcast_send(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id != ADMIN_ID:
+        return ConversationHandler.END
+
+    text   = update.message.text.strip()
+    ok     = 0
+    failed = 0
+
+    status = await update.message.reply_text("📤 Sending...")
+
+    for uid, u in db["users"].items():
+        if u.get("banned"):
+            continue
+        try:
+            await context.bot.send_message(
+                chat_id=int(uid),
+                text=f"📢 *Broadcast*\n━━━━━━━━━━━━━━━\n{text}",
+                parse_mode="Markdown"
+            )
+            ok += 1
+        except Exception:
+            failed += 1
+        await asyncio.sleep(0.05)
+
+    await status.edit_text(
+        f"📢 *Broadcast Complete*\n\n✅ Sent: {ok}\n❌ Failed: {failed}",
+        parse_mode="Markdown",
+        reply_markup=admin_menu_kb()
+    )
+    return ConversationHandler.END
+
+
+async def broadcast_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("❌ Broadcast cancelled.", reply_markup=admin_menu_kb())
+    return ConversationHandler.END
+
+# ═══════════════════════════════════════════
+#  INLINE BUTTONS
+# ═══════════════════════════════════════════
 
 async def buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
@@ -215,90 +324,154 @@ async def buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if query.from_user.id != ADMIN_ID:
         return
 
-    data = query.data
-    parts = data.split(":")
+    parts  = query.data.split(":")
     action = parts[0]
-    uid = parts[1]
+    uid    = parts[1] if len(parts) > 1 else None
+
+    # ── Menu ─────────────────────────────────
+
+    if action == "menu":
+        if uid == "users":
+            await _show_users(query)
+        elif uid == "banned":
+            await _show_banned(query)
+        elif uid == "back":
+            total  = len(db["users"])
+            banned = sum(1 for u in db["users"].values() if u.get("banned"))
+            await query.edit_message_text(
+                f"👑 *Admin Panel*\n"
+                f"━━━━━━━━━━━━━━━\n"
+                f"👥 Total users : {total}\n"
+                f"🚫 Banned      : {banned}\n"
+                f"━━━━━━━━━━━━━━━",
+                parse_mode="Markdown",
+                reply_markup=admin_menu_kb()
+            )
+        return
+
+    # ── User actions ─────────────────────────
+
+    if not uid:
+        return
 
     if action == "ban":
         if uid not in db["users"]:
-            await query.edit_message_text("⚠️ User not found.")
+            await query.answer("User not found.", show_alert=True)
             return
         db["users"][uid]["banned"] = True
         save_db()
         name = db["users"][uid]["name"]
-        await query.edit_message_text(f"🚫 *{name}* has been banned.", parse_mode="Markdown")
+        try:
+            await query.edit_message_reply_markup(reply_markup=message_kb(uid))
+        except Exception:
+            pass
+        await query.answer(f"🚫 {name} banned.", show_alert=True)
 
     elif action == "unban":
         if uid not in db["users"]:
-            await query.edit_message_text("⚠️ User not found.")
+            await query.answer("User not found.", show_alert=True)
             return
         db["users"][uid]["banned"] = False
         save_db()
         name = db["users"][uid]["name"]
-        await query.edit_message_text(f"✅ *{name}* has been unbanned.", parse_mode="Markdown")
+        # Refresh the manage panel
+        u    = db["users"][uid]
+        msgs = len(db["messages"].get(uid, []))
+        try:
+            await query.edit_message_text(
+                f"👤 *User Profile*\n"
+                f"━━━━━━━━━━━━━━━\n"
+                f"Name   : {name}\n"
+                f"ID     : `{uid}`\n"
+                f"Status : ✅ Active\n"
+                f"Msgs   : {msgs}",
+                parse_mode="Markdown",
+                reply_markup=user_manage_kb(uid)
+            )
+        except Exception:
+            pass
+        await query.answer(f"✅ {name} unbanned.", show_alert=True)
 
     elif action == "history":
         msgs = db["messages"].get(uid, [])
         if not msgs:
             await query.answer("No messages yet.", show_alert=True)
             return
-        # Last 5 messages
         recent = msgs[-5:]
-        lines = [f"📜 *Last {len(recent)} messages:*\n"]
+        lines  = []
         for m in recent:
-            t = m["time"][:16]
-            lines.append(f"`{t}` — {m['text'][:60]}")
-        await query.answer("\n".join(lines)[:200], show_alert=True)
+            t    = m["time"][:16]
+            snip = m["text"][:70]
+            lines.append(f"{t}\n{snip}")
+        await query.answer("\n\n".join(lines)[:200], show_alert=True)
 
-# ---------------- USERS LIST ----------------
+    elif action == "manage":
+        if uid not in db["users"]:
+            await query.answer("User not found.", show_alert=True)
+            return
+        u    = db["users"][uid]
+        name = u["name"]
+        msgs = len(db["messages"].get(uid, []))
+        status_str = "🚫 Banned" if u.get("banned") else "✅ Active"
+        await query.edit_message_text(
+            f"👤 *User Profile*\n"
+            f"━━━━━━━━━━━━━━━\n"
+            f"Name   : {name}\n"
+            f"ID     : `{uid}`\n"
+            f"Status : {status_str}\n"
+            f"Msgs   : {msgs}",
+            parse_mode="Markdown",
+            reply_markup=user_manage_kb(uid)
+        )
 
-async def users_list(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_user.id != ADMIN_ID:
+
+async def _show_users(query):
+    active = {uid: u for uid, u in db["users"].items() if not u.get("banned")}
+    if not active:
+        await query.edit_message_text("No active users yet.", reply_markup=admin_menu_kb())
         return
 
-    if not db["users"]:
-        await update.message.reply_text("No users yet.")
+    lines = [f"👥 *Active Users* ({len(active)})\n━━━━━━━━━━━━━━━"]
+    btns  = []
+    for uid, u in active.items():
+        msgs = len(db["messages"].get(uid, []))
+        lines.append(f"• *{u['name']}* — {msgs} msg(s)")
+        btns.append([InlineKeyboardButton(
+            f"👤 {u['name']}  ({msgs} msgs)", callback_data=f"manage:{uid}"
+        )])
+
+    btns.append([InlineKeyboardButton("🔙 Back", callback_data="menu:back")])
+    await query.edit_message_text(
+        "\n".join(lines),
+        parse_mode="Markdown",
+        reply_markup=InlineKeyboardMarkup(btns)
+    )
+
+
+async def _show_banned(query):
+    banned = {uid: u for uid, u in db["users"].items() if u.get("banned")}
+    if not banned:
+        await query.edit_message_text("No banned users 🎉", reply_markup=admin_menu_kb())
         return
 
-    lines = ["👥 *User List:*\n"]
-    for uid, u in db["users"].items():
-        status = "🚫" if u.get("banned") else "✅"
-        msg_count = len(db["messages"].get(uid, []))
-        lines.append(f"{status} *{u['name']}* — `{uid}` — {msg_count} msgs")
+    lines = [f"🚫 *Banned Users* ({len(banned)})\n━━━━━━━━━━━━━━━"]
+    btns  = []
+    for uid, u in banned.items():
+        lines.append(f"• {u['name']} — `{uid}`")
+        btns.append([InlineKeyboardButton(
+            f"✅ Unban {u['name']}", callback_data=f"unban:{uid}"
+        )])
 
-    await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
+    btns.append([InlineKeyboardButton("🔙 Back", callback_data="menu:back")])
+    await query.edit_message_text(
+        "\n".join(lines),
+        parse_mode="Markdown",
+        reply_markup=InlineKeyboardMarkup(btns)
+    )
 
-# ---------------- BROADCAST ----------------
-
-async def broadcast(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_user.id != ADMIN_ID:
-        return
-
-    if not context.args:
-        await update.message.reply_text("Usage: /broadcast Your message here")
-        return
-
-    text = " ".join(context.args)
-    sent = 0
-    failed = 0
-
-    for uid, u in db["users"].items():
-        if u.get("banned"):
-            continue
-        try:
-            await context.bot.send_message(
-                chat_id=int(uid),
-                text=f"📢 *Broadcast:*\n\n{text}",
-                parse_mode="Markdown"
-            )
-            sent += 1
-        except Exception:
-            failed += 1
-
-    await update.message.reply_text(f"📢 Broadcast done.\n✅ Sent: {sent}\n❌ Failed: {failed}")
-
-# ---------------- FLASK (KEEP ALIVE) ----------------
+# ═══════════════════════════════════════════
+#  FLASK KEEP-ALIVE
+# ═══════════════════════════════════════════
 
 web = Flask(__name__)
 
@@ -309,23 +482,49 @@ def home():
 def run_web():
     web.run(host="0.0.0.0", port=10000)
 
-# ---------------- MAIN ----------------
+# ═══════════════════════════════════════════
+#  MAIN
+# ═══════════════════════════════════════════
 
 def run_bot():
     app = ApplicationBuilder().token(TOKEN).build()
 
-    app.add_handler(CommandHandler("start", start))
-    app.add_handler(CommandHandler("users", users_list))
-    app.add_handler(CommandHandler("broadcast", broadcast))
+    # Reply conversation
+    reply_conv = ConversationHandler(
+        entry_points=[CallbackQueryHandler(reply_start, pattern=r"^reply:")],
+        states={
+            WAITING_REPLY: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, reply_send)
+            ]
+        },
+        fallbacks=[CommandHandler("cancel", reply_cancel)],
+        per_user=True,
+        per_chat=True,
+    )
 
-    # Single handler for ALL text — admin vs user logic is inside
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_user))
+    # Broadcast conversation
+    bcast_conv = ConversationHandler(
+        entry_points=[CallbackQueryHandler(broadcast_start, pattern=r"^menu:broadcast$")],
+        states={
+            WAITING_BCAST: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, broadcast_send)
+            ]
+        },
+        fallbacks=[CommandHandler("cancel", broadcast_cancel)],
+        per_user=True,
+        per_chat=True,
+    )
+
+    # Order matters — ConversationHandlers first
+    app.add_handler(CommandHandler("start", start))
+    app.add_handler(reply_conv)
+    app.add_handler(bcast_conv)
     app.add_handler(CallbackQueryHandler(buttons))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_user))
 
     print("✅ Bot running...")
-    app.run_polling()
+    app.run_polling(drop_pending_updates=True)
 
-# ---------------- START ----------------
 
 threading.Thread(target=run_web, daemon=True).start()
 run_bot()
