@@ -2,7 +2,7 @@ import os
 import json
 import asyncio
 import threading
-from datetime import datetime
+from datetime import datetime, timedelta
 from flask import Flask
 
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
@@ -17,6 +17,7 @@ ADMIN_ID = 6388027054
 
 DATA_FILE    = "data.json"
 MSG_MAP_FILE = "msg_map.json"
+MSG_EXPIRE_HOURS = 6  # Messages expire after 6 hours
 
 # ── DB ──────────────────────────────────────────────────
 
@@ -35,6 +36,66 @@ msg_map = load_json(MSG_MAP_FILE, {})
 
 def save_db():      save_json(DATA_FILE,    db)
 def save_msg_map(): save_json(MSG_MAP_FILE, msg_map)
+
+def add_to_cleanup_queue(uid, message_id, chat_id):
+    """Track messages for future cleanup"""
+    cleanup_data = load_json("cleanup.json", {})
+    expire_time = (datetime.now() + timedelta(hours=MSG_EXPIRE_HOURS)).timestamp()
+    
+    if uid not in cleanup_data:
+        cleanup_data[uid] = []
+    
+    cleanup_data[uid].append({
+        "message_id": message_id,
+        "chat_id": chat_id,
+        "expire_time": expire_time
+    })
+    
+    save_json("cleanup.json", cleanup_data)
+
+async def cleanup_old_messages(bot):
+    """Delete expired messages from user chats every 30 minutes"""
+    while True:
+        try:
+            cleanup_data = load_json("cleanup.json", {})
+            current_time = datetime.now().timestamp()
+            modified = False
+            
+            for uid in list(cleanup_data.keys()):
+                if uid in cleanup_data:
+                    expired = []
+                    active = []
+                    
+                    for msg in cleanup_data[uid]:
+                        if msg["expire_time"] <= current_time:
+                            expired.append(msg)
+                        else:
+                            active.append(msg)
+                    
+                    for msg in expired:
+                        try:
+                            await bot.delete_message(
+                                chat_id=msg["chat_id"],
+                                message_id=msg["message_id"]
+                            )
+                            print(f"Deleted message {msg['message_id']} from {uid}")
+                        except Exception as e:
+                            print(f"Failed to delete message {msg['message_id']}: {e}")
+                    
+                    if active:
+                        cleanup_data[uid] = active
+                        modified = True
+                    else:
+                        del cleanup_data[uid]
+                        modified = True
+            
+            if modified:
+                save_json("cleanup.json", cleanup_data)
+            
+        except Exception as e:
+            print(f"Cleanup error: {e}")
+        
+        await asyncio.sleep(30 * 60)  # Check every 30 minutes
 
 def log_msg(uid, text, status):
     db["messages"].setdefault(uid, []).append({
@@ -201,6 +262,9 @@ async def handle_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
         msg_map[str(sent.message_id)] = uid
         save_msg_map()
         log_msg(uid, text, "sent")
+        
+        # Track user's message for cleanup
+        add_to_cleanup_queue(uid, update.message.message_id, update.effective_chat.id)
 
     except Exception as e:
         print("Forward error:", e)
@@ -243,6 +307,9 @@ async def handle_user_media(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         save_msg_map()
         log_msg(uid, label, "sent")
+        
+        # Track user's media message for cleanup
+        add_to_cleanup_queue(uid, msg.message_id, update.effective_chat.id)
 
     except Exception as e:
         print("Media forward error:", e)
@@ -282,9 +349,13 @@ async def reply_send(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return ConversationHandler.END
 
     try:
-        await context.bot.send_message(chat_id=int(uid), text=update.message.text)
+        sent = await context.bot.send_message(chat_id=int(uid), text=update.message.text)
         log_msg(uid, f"[→] {update.message.text}", "admin_reply")
         await update.message.reply_text(f"✅ Sent to {name}")
+        
+        # Track admin's reply for cleanup in user's chat
+        add_to_cleanup_queue(uid, sent.message_id, int(uid))
+        
     except Exception as e:
         await update.message.reply_text(f"❌ Failed: {e}")
 
@@ -308,10 +379,15 @@ async def reply_send_media(update: Update, context: ContextTypes.DEFAULT_TYPE):
     label = media_label(msg)
 
     try:
-        await forward_media(context.bot, msg, int(uid),
+        sent = await forward_media(context.bot, msg, int(uid),
                             caption=msg.caption or None)
         log_msg(uid, f"[→] {label}", "admin_reply")
         await update.message.reply_text(f"✅ {label} sent to {name}")
+        
+        # Track admin's media reply for cleanup in user's chat
+        if sent:
+            add_to_cleanup_queue(uid, sent.message_id, int(uid))
+        
     except Exception as e:
         await update.message.reply_text(f"❌ Failed: {e}")
 
@@ -353,11 +429,16 @@ async def bcast_send(update: Update, context: ContextTypes.DEFAULT_TYPE):
             continue
         try:
             if msg.text:
-                await context.bot.send_message(chat_id=int(uid), text=msg.text)
+                sent = await context.bot.send_message(chat_id=int(uid), text=msg.text)
             else:
-                await forward_media(context.bot, msg, int(uid),
+                sent = await forward_media(context.bot, msg, int(uid),
                                     caption=msg.caption or None)
             ok += 1
+            
+            # Track broadcast message for cleanup in user's chat
+            if sent:
+                add_to_cleanup_queue(uid, sent.message_id, int(uid))
+                
         except Exception:
             failed += 1
         await asyncio.sleep(0.05)
@@ -493,8 +574,12 @@ def run_web():
 
 # ── MAIN ─────────────────────────────────────────────────
 
+async def post_init(app):
+    """Start background cleanup task"""
+    asyncio.create_task(cleanup_old_messages(app.bot))
+
 def run_bot():
-    app = ApplicationBuilder().token(TOKEN).build()
+    app = ApplicationBuilder().token(TOKEN).post_init(post_init).build()
 
     # Media filter for all non-text content
     MEDIA_FILTER = (
@@ -538,7 +623,7 @@ def run_bot():
     # User media messages (forwarded to admin with Reply + Menu buttons)
     app.add_handler(MessageHandler(MEDIA_FILTER, handle_user_media))
 
-    print("Bot running...")
+    print("Bot running with auto-delete (6 hour expiry)...")
     app.run_polling(drop_pending_updates=True)
 
 
